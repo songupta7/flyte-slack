@@ -23,6 +23,10 @@ import (
 	"github.com/HotelsDotCom/flyte-client/flyte"
 	"github.com/HotelsDotCom/go-logger"
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
+	"github.com/slack-go/slack/socketmode"
+	"log"
+	"os"
 )
 
 type client interface {
@@ -33,6 +37,13 @@ type client interface {
 	GetConversations(params *slack.GetConversationsParameters) (channels []slack.Channel, nextCursor string, err error)
 	GetReactions(item slack.ItemRef, params slack.GetReactionsParameters) (reactions []slack.ItemReaction, err error)
 	ListReactions(params slack.ListReactionsParameters) ([]slack.ReactedItem, *slack.Paging, error)
+}
+
+type socketclient interface {
+}
+
+type Slacksocketclient interface {
+	IncomingMessages() <-chan flyte.Event
 }
 
 // our slack implementation makes consistent use of channel id
@@ -57,6 +68,18 @@ type slackClient struct {
 	incomingMessages chan flyte.Event
 }
 
+type slackSocketClient struct {
+	client socketclient
+	// events received from slack
+	incomingEvents chan socketmode.Event
+	// messages to be consumed by API (filtered incoming events)
+	incomingMessages chan flyte.Event
+}
+
+func (apiClient *slackSocketClient) IncomingMessages() <-chan flyte.Event {
+	return apiClient.incomingMessages
+}
+
 func NewSlack(token string) Slack {
 
 	rtm := slack.New(token).NewRTM()
@@ -71,6 +94,153 @@ func NewSlack(token string) Slack {
 	logger.Info("initialized slack")
 	go sl.handleMessageEvents()
 	return sl
+}
+
+func NewSocketBasedSlack(appToken string, botToken string) Slacksocketclient {
+
+	slackapi := slack.New(
+		botToken,
+		slack.OptionDebug(true),
+		slack.OptionLog(log.New(os.Stdout, "api: ", log.Lshortfile|log.LstdFlags)),
+		slack.OptionAppLevelToken(appToken),
+	)
+
+	smodeclient := socketmode.New(
+		slackapi,
+		socketmode.OptionDebug(true),
+		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
+	)
+
+	apiClient := &slackSocketClient{
+		client:           smodeclient,
+		incomingEvents:   smodeclient.Events,
+		incomingMessages: make(chan flyte.Event),
+	}
+
+	go apiClient.handleSocketBasedEvents(smodeclient)
+
+	go smodeclient.Run()
+
+	logger.Info("initialized slack")
+
+	return apiClient
+
+}
+
+func (apiClient *slackSocketClient) handleSocketBasedEvents(smodeclient *socketmode.Client) {
+	logger.Debugf("Calling")
+	for evt := range apiClient.incomingEvents {
+		switch evt.Type {
+		case socketmode.EventTypeConnecting:
+			fmt.Println("Connecting to Slack with Socket Mode...")
+		case socketmode.EventTypeConnectionError:
+			fmt.Println("Connection failed. Retrying later...")
+		case socketmode.EventTypeConnected:
+			fmt.Println("Connected to Slack with Socket Mode.")
+
+		case socketmode.EventTypeEventsAPI:
+
+			eventsAPIEvent, ok := evt.Data.(slackevents.EventsAPIEvent)
+			logger.Debugf("EventTypeAPI recieved !!")
+			fmt.Println("EventTypeAPI Recieved!!!!!")
+
+			if !ok {
+
+				logger.Debugf("Ignored %+v\n", evt)
+
+				continue
+			}
+
+			logger.Debugf("Event received: %+v\n", eventsAPIEvent)
+
+			smodeclient.Ack(*evt.Request)
+
+			switch eventsAPIEvent.Type {
+
+			case slackevents.Message:
+				logger.Debugf("This is message evernt succc")
+
+			case slackevents.CallbackEvent:
+				innerEvent := eventsAPIEvent.InnerEvent
+				switch ev := innerEvent.Data.(type) {
+
+				case *slackevents.AppMentionEvent:
+					logger.Debugf(" app mention Event recieved %v", ev)
+
+				case *slackevents.MemberJoinedChannelEvent:
+					fmt.Printf("user %q joined to channel %q", ev.User, ev.Channel)
+
+				case *slackevents.MessageEvent:
+					logger.Debugf(" Message Event recieved %v", ev)
+
+				}
+			default:
+				logger.Debugf("unsupported Events API event received")
+			}
+		case socketmode.EventTypeInteractive:
+			callback, ok := evt.Data.(slack.InteractionCallback)
+			if !ok {
+				fmt.Printf("Ignored %+v\n", evt)
+
+				continue
+			}
+
+			fmt.Printf("Interaction received: %+v\n", callback)
+
+			var payload interface{}
+
+			switch callback.Type {
+			case slack.InteractionTypeBlockActions:
+				// See https://api.slack.com/apis/connections/socket-implement#button
+
+				logger.Debugf("button clicked!")
+			case slack.InteractionTypeShortcut:
+			case slack.InteractionTypeViewSubmission:
+				// See https://api.slack.com/apis/connections/socket-implement#modal
+			case slack.InteractionTypeDialogSubmission:
+			default:
+
+			}
+
+			smodeclient.Ack(*evt.Request, payload)
+		case socketmode.EventTypeSlashCommand:
+			cmd, ok := evt.Data.(slack.SlashCommand)
+			if !ok {
+				fmt.Printf("Ignored %+v\n", evt)
+
+				continue
+			}
+
+			logger.Debugf("Slash command received: %+v", cmd)
+
+			payload := map[string]interface{}{
+				"blocks": []slack.Block{
+					slack.NewSectionBlock(
+						&slack.TextBlockObject{
+							Type: slack.MarkdownType,
+							Text: "foo",
+						},
+						nil,
+						slack.NewAccessory(
+							slack.NewButtonBlockElement(
+								"",
+								"somevalue",
+								&slack.TextBlockObject{
+									Type: slack.PlainTextType,
+									Text: "bar",
+								},
+							),
+						),
+					),
+				}}
+
+			smodeclient.Ack(*evt.Request, payload)
+
+		default:
+			fmt.Fprintf(os.Stderr, "Unexpected event type received: %s\n", evt.Type)
+		}
+	}
+
 }
 
 const (

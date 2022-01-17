@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
 	"github.com/ExpediaGroup/flyte-slack/cache"
 	"github.com/ExpediaGroup/flyte-slack/client"
 	"github.com/ExpediaGroup/flyte-slack/command"
@@ -24,6 +25,8 @@ import (
 	"github.com/HotelsDotCom/flyte-client/flyte"
 	"github.com/HotelsDotCom/go-logger"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -32,7 +35,29 @@ const defaultPackName = "Slack"
 
 func main() {
 
-	slack := client.NewSlack(slackToken())
+	appToken := os.Getenv("SLACK_APP_TOKEN")
+	if appToken == "" {
+		fmt.Fprintf(os.Stderr, "SLACK_APP_TOKEN must be set.\n")
+		os.Exit(1)
+	}
+
+	if !strings.HasPrefix(appToken, "xapp-") {
+		fmt.Fprintf(os.Stderr, "SLACK_APP_TOKEN must have the prefix \"xapp-\".")
+	}
+
+	botToken := os.Getenv("SLACK_BOT_TOKEN")
+	if botToken == "" {
+		fmt.Fprintf(os.Stderr, "SLACK_BOT_TOKEN must be set.\n")
+		os.Exit(1)
+	}
+
+	if !strings.HasPrefix(botToken, "xoxb-") {
+		fmt.Fprintf(os.Stderr, "SLACK_BOT_TOKEN must have the prefix \"xoxb-\".")
+	}
+
+	slack := client.NewSocketBasedSlack(appToken, botToken)
+
+	//slack := client.NewSlack(slackToken())
 	cc, err := cacheConfig()
 	if err != nil {
 		logger.Fatal(err)
@@ -40,14 +65,15 @@ func main() {
 
 	cache := cache.New(cc)
 
-	packDef := GetPackDef(slack, cache)
+	packDef := GetSocketPackDef(slack, cache)
 	pack := flyte.NewPack(packDef, api.NewClient(apiHost(), 10*time.Second))
 	pack.Start()
 
 	ListenAndServe(slack, pack)
+
 }
 
-func ListenAndServe(slack client.Slack, pack flyte.Pack) {
+func ListenAndServe(slack client.Slacksocketclient, pack flyte.Pack) {
 
 	// handle incoming messages
 	incomingMessages := slack.IncomingMessages()
@@ -79,9 +105,34 @@ func GetPackDef(slack client.Slack, cache cache.Cache) flyte.PackDef {
 			command.SendMessage(slack),
 			command.SendRichMessage(slack),
 			command.GetChannelInfo(slack, cache),
+			command.GetReactionMsg(slack),
+			command.GetReactionList(slack),
 		},
 		EventDefs: []flyte.EventDef{
 			{Name: "ReceivedMessage"},
+			{Name: "ReactionAdded"},
+		},
+	}
+}
+func GetSocketPackDef(slack client.Slacksocketclient, cache cache.Cache) flyte.PackDef {
+
+	helpUrl, err := url.Parse(packDefHelpUrl)
+	if err != nil {
+		logger.Fatal("invalid pack help url")
+	}
+
+	packName := packName()
+	if packName == "" {
+		packName = defaultPackName
+	}
+
+	return flyte.PackDef{
+		Name:     packName,
+		HelpURL:  helpUrl,
+		Commands: []flyte.Command{},
+		EventDefs: []flyte.EventDef{
+			{Name: "ReceivedMessage"},
+			{Name: "ReactionAdded"},
 		},
 	}
 }
